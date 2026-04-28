@@ -1,4 +1,4 @@
-import { useState } from 'preact/hooks';
+import { useMemo } from 'preact/hooks';
 import {
   CreditCard,
   FileKey2,
@@ -10,6 +10,7 @@ import {
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { t } from '@/lib/i18n';
 import type { Cipher, CipherAttachment, CustomFieldType, VaultDraft, VaultDraftField, VaultDraftLoginUri } from '@/lib/types';
+import WebsiteIcon from './WebsiteIcon';
 
 export type TypeFilter = 'login' | 'card' | 'identity' | 'note' | 'ssh';
 export type VaultSortMode = 'edited' | 'created' | 'name';
@@ -36,10 +37,16 @@ export const CREATE_TYPE_OPTIONS: TypeOption[] = [
 ];
 
 export const VAULT_SORT_STORAGE_KEY = 'nodewarden.vault.sort.v1';
-export const MOBILE_LAYOUT_QUERY = '(max-width: 900px)';
-export const VAULT_LIST_ROW_HEIGHT = 66;
+export const FOLDER_SORT_STORAGE_KEY = 'nodewarden.folder-sort.v1';
+export const MOBILE_LAYOUT_QUERY = '(max-width: 1180px)';
+export const VAULT_LIST_ROW_HEIGHT = 74;
 export const VAULT_LIST_OVERSCAN = 10;
 export const VAULT_SORT_OPTIONS: Array<{ value: VaultSortMode; label: string }> = [
+  { value: 'edited', label: t('txt_sort_last_edited') },
+  { value: 'created', label: t('txt_sort_created') },
+  { value: 'name', label: t('txt_sort_name') },
+];
+export const FOLDER_SORT_OPTIONS: Array<{ value: VaultSortMode; label: string }> = [
   { value: 'edited', label: t('txt_sort_last_edited') },
   { value: 'created', label: t('txt_sort_created') },
   { value: 'name', label: t('txt_sort_name') },
@@ -161,7 +168,7 @@ export function hostFromUri(uri: string): string {
 }
 
 export function websiteIconUrl(host: string): string {
-  return `/icons/${encodeURIComponent(host)}/icon.png`;
+  return `/icons/${encodeURIComponent(host)}/icon.png?fallback=404`;
 }
 
 export function createEmptyLoginUri(): VaultDraftLoginUri {
@@ -427,32 +434,8 @@ export function firstPasskeyCreationTime(cipher: Cipher | null): string | null {
   return null;
 }
 
-const failedIconHosts = new Set<string>();
-
 export function VaultListIcon({ cipher }: { cipher: Cipher }) {
-  const uri = firstCipherUri(cipher);
-  const host = hostFromUri(uri);
-  const [errored, setErrored] = useState(() => (host ? failedIconHosts.has(host) : false));
-  if (host && !errored) {
-    return (
-      <img
-        className="list-icon"
-        src={websiteIconUrl(host)}
-        alt=""
-        loading="lazy"
-        referrerPolicy="no-referrer"
-        onError={() => {
-          failedIconHosts.add(host);
-          setErrored(true);
-        }}
-      />
-    );
-  }
-  return (
-    <span className="list-icon-fallback">
-      <TypeIcon type={Number(cipher.type || 1)} />
-    </span>
-  );
+  return <WebsiteIcon cipher={cipher} fallback={<TypeIcon type={Number(cipher.type || 1)} />} />;
 }
 
 export function copyToClipboard(value: string): void {

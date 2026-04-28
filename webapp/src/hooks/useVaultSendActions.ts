@@ -13,6 +13,7 @@ import {
   encryptZipBytesWithPassword,
 } from '@/lib/export-formats';
 import { base64ToBytes, decryptBw, decryptBwFileData, decryptStr } from '@/lib/crypto';
+import { decryptSingleCipher } from '@/lib/decrypt-cipher';
 import { t } from '@/lib/i18n';
 import {
   buildPublicSendUrl,
@@ -66,6 +67,8 @@ interface UseVaultSendActionsOptions {
   refetchFolders: () => Promise<{ data?: VaultFolder[] | undefined } | unknown>;
   refetchSends: () => Promise<unknown>;
   onNotify: Notify;
+  patchDecryptedCiphers: (updater: (prev: Cipher[]) => Cipher[]) => void;
+  patchDecryptedFolders: (updater: (prev: VaultFolder[]) => VaultFolder[]) => void;
 }
 
 function extractImportIdMaps(cipherMap: ImportedCipherMapEntry[] | null) {
@@ -95,6 +98,8 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
     refetchFolders,
     refetchSends,
     onNotify,
+    patchDecryptedCiphers,
+    patchDecryptedFolders,
   } = options;
   const [downloadingAttachmentKey, setDownloadingAttachmentKey] = useState('');
   const [attachmentDownloadPercent, setAttachmentDownloadPercent] = useState<number | null>(null);
@@ -107,6 +112,75 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
     const refetchVault = async () => {
       await Promise.all([refetchCiphers(), refetchFolders(), refetchSends()]);
     };
+
+    const syncVaultCoreInBackground = (options?: { includeFolders?: boolean }) => {
+      const tasks: Promise<unknown>[] = [Promise.resolve(refetchCiphers())];
+      if (options?.includeFolders) {
+        tasks.push(Promise.resolve(refetchFolders()));
+      }
+      void Promise.all(tasks).catch(() => undefined);
+    };
+
+    async function decryptAndPatch(encrypted: Cipher) {
+      if (!session?.symEncKey || !session?.symMacKey) {
+        await refetchCiphers();
+        return;
+      }
+      const encKey = base64ToBytes(session.symEncKey);
+      const macKey = base64ToBytes(session.symMacKey);
+      const decrypted = await decryptSingleCipher(encrypted, encKey, macKey);
+      patchDecryptedCiphers((prev) => {
+        const idx = prev.findIndex((c) => c.id === decrypted.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = decrypted;
+          return next;
+        }
+        return [decrypted, ...prev];
+      });
+    }
+
+    function removeCipherFromState(id: string) {
+      patchDecryptedCiphers((prev) => prev.filter((c) => c.id !== id));
+    }
+
+    function patchCipherBatch(ids: string[], updater: (cipher: Cipher) => Cipher | null) {
+      const idSet = new Set(ids.map((id) => String(id || '').trim()).filter(Boolean));
+      if (!idSet.size) return;
+      patchDecryptedCiphers((prev) => {
+        let changed = false;
+        const next: Cipher[] = [];
+        for (const cipher of prev) {
+          if (!idSet.has(cipher.id)) {
+            next.push(cipher);
+            continue;
+          }
+          const updated = updater(cipher);
+          changed = true;
+          if (updated) next.push(updated);
+        }
+        return changed ? next : prev;
+      });
+    }
+
+    function patchFolderBatch(ids: string[], updater: (folder: VaultFolder) => VaultFolder | null) {
+      const idSet = new Set(ids.map((id) => String(id || '').trim()).filter(Boolean));
+      if (!idSet.size) return;
+      patchDecryptedFolders((prev) => {
+        let changed = false;
+        const next: VaultFolder[] = [];
+        for (const folder of prev) {
+          if (!idSet.has(folder.id)) {
+            next.push(folder);
+            continue;
+          }
+          const updated = updater(folder);
+          changed = true;
+          if (updated) next.push(updated);
+        }
+        return changed ? next : prev;
+      });
+    }
 
     const uploadImportedAttachments = async (
       attachments: ImportAttachmentFile[],
@@ -175,7 +249,8 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
             setAttachmentUploadPercent(0);
             await uploadCipherAttachment(authedFetch, session, created.id, file, undefined, setAttachmentUploadPercent);
           }
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          await decryptAndPatch(created);
+          syncVaultCoreInBackground({ includeFolders: !!draft.folderId || attachments.length > 0 });
           onNotify('success', t('txt_item_created'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_create_item_failed'));
@@ -191,7 +266,7 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         const addFiles = Array.isArray(options?.addFiles) ? options.addFiles : [];
         const removeAttachmentIds = Array.isArray(options?.removeAttachmentIds) ? options.removeAttachmentIds : [];
         try {
-          await updateCipher(authedFetch, session, cipher, draft);
+          const updated = await updateCipher(authedFetch, session, cipher, draft);
           for (const attachmentId of removeAttachmentIds) {
             const id = String(attachmentId || '').trim();
             if (!id) continue;
@@ -202,7 +277,13 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
             setAttachmentUploadPercent(0);
             await uploadCipherAttachment(authedFetch, session, cipher.id, file, cipher, setAttachmentUploadPercent);
           }
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          await decryptAndPatch(updated);
+          syncVaultCoreInBackground({
+            includeFolders:
+              draft.folderId !== (cipher.folderId || '')
+              || addFiles.length > 0
+              || removeAttachmentIds.length > 0,
+          });
           onNotify('success', t('txt_item_updated'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_update_item_failed'));
@@ -233,8 +314,9 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
 
       async deleteVaultItem(cipher: Cipher) {
         try {
-          await deleteCipher(authedFetch, cipher.id);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          const deleted = await deleteCipher(authedFetch, cipher.id);
+          await decryptAndPatch(deleted);
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_item_deleted'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_delete_item_failed'));
@@ -244,8 +326,9 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
 
       async archiveVaultItem(cipher: Cipher) {
         try {
-          await archiveCipher(authedFetch, cipher.id);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          const archived = await archiveCipher(authedFetch, cipher.id);
+          await decryptAndPatch(archived);
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_item_archived'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_archive_item_failed'));
@@ -255,8 +338,9 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
 
       async unarchiveVaultItem(cipher: Cipher) {
         try {
-          await unarchiveCipher(authedFetch, cipher.id);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          const unarchived = await unarchiveCipher(authedFetch, cipher.id);
+          await decryptAndPatch(unarchived);
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_item_unarchived'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_unarchive_item_failed'));
@@ -267,7 +351,9 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       async bulkDeleteVaultItems(ids: string[]) {
         try {
           await bulkDeleteCiphers(authedFetch, ids);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          const deletedDate = new Date().toISOString();
+          patchCipherBatch(ids, (cipher) => ({ ...cipher, deletedDate, archivedDate: null }));
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_deleted_selected_items'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_bulk_delete_failed'));
@@ -278,7 +364,9 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       async bulkArchiveVaultItems(ids: string[]) {
         try {
           await bulkArchiveCiphers(authedFetch, ids);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          const archivedDate = new Date().toISOString();
+          patchCipherBatch(ids, (cipher) => ({ ...cipher, archivedDate, deletedDate: null }));
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_archived_selected_items'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_bulk_archive_failed'));
@@ -289,7 +377,8 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       async bulkUnarchiveVaultItems(ids: string[]) {
         try {
           await bulkUnarchiveCiphers(authedFetch, ids);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          patchCipherBatch(ids, (cipher) => ({ ...cipher, archivedDate: null }));
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_unarchived_selected_items'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_bulk_unarchive_failed'));
@@ -300,7 +389,8 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       async bulkMoveVaultItems(ids: string[], folderId: string | null) {
         try {
           await bulkMoveCiphers(authedFetch, ids, folderId);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          patchCipherBatch(ids, (cipher) => ({ ...cipher, folderId }));
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_moved_selected_items'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_bulk_move_failed'));
@@ -316,8 +406,16 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         }
         try {
           if (!session) throw new Error(t('txt_vault_key_unavailable'));
-          await createFolder(authedFetch, session, folderName);
-          await refetchFolders();
+          const created = await createFolder(authedFetch, session, folderName);
+          patchDecryptedFolders((prev) => [
+            {
+              id: created.id,
+              name: created.name || folderName,
+              decName: folderName,
+            },
+            ...prev,
+          ]);
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_folder_created'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_create_folder_failed'));
@@ -333,7 +431,9 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         }
         try {
           await deleteFolder(authedFetch, id);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          patchFolderBatch([id], () => null);
+          patchDecryptedCiphers((prev) => prev.map((cipher) => (cipher.folderId === id ? { ...cipher, folderId: null } : cipher)));
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_folder_deleted'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_delete_folder_failed'));
@@ -355,7 +455,8 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         try {
           if (!session) throw new Error(t('txt_vault_key_unavailable'));
           await updateFolder(authedFetch, session, id, nextName);
-          await refetchFolders();
+          patchFolderBatch([id], (folder) => ({ ...folder, decName: nextName }));
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_folder_updated'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_update_folder_failed'));
@@ -366,7 +467,8 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       async bulkRestoreVaultItems(ids: string[]) {
         try {
           await bulkRestoreCiphers(authedFetch, ids);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          patchCipherBatch(ids, (cipher) => ({ ...cipher, deletedDate: null }));
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_restored_selected_items'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_bulk_restore_failed'));
@@ -377,7 +479,8 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
       async bulkPermanentDeleteVaultItems(ids: string[]) {
         try {
           await bulkPermanentDeleteCiphers(authedFetch, ids);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          patchCipherBatch(ids, () => null);
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_deleted_selected_items_permanently'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_bulk_permanent_delete_failed'));
@@ -390,7 +493,10 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         if (!ids.length) return;
         try {
           await bulkDeleteFolders(authedFetch, ids);
-          await Promise.all([refetchCiphers(), refetchFolders()]);
+          const removedIds = new Set(ids);
+          patchDecryptedFolders((prev) => prev.filter((folder) => !removedIds.has(folder.id)));
+          patchDecryptedCiphers((prev) => prev.map((cipher) => (cipher.folderId && removedIds.has(cipher.folderId) ? { ...cipher, folderId: null } : cipher)));
+          syncVaultCoreInBackground({ includeFolders: true });
           onNotify('success', t('txt_folders_deleted'));
         } catch (error) {
           onNotify('error', error instanceof Error ? error.message : t('txt_delete_all_folders_failed'));
@@ -524,7 +630,10 @@ export default function useVaultSendActions(options: UseVaultSendActionsOptions)
         for (let i = 0; i < payload.ciphers.length; i++) {
           const raw = (payload.ciphers[i] || {}) as Record<string, unknown>;
           const draft = importCipherToDraft(raw, mode === 'target' ? targetFolderId : null);
-          nextPayload.ciphers.push(await buildCipherImportPayload(session, draft));
+          const cipherPayload = await buildCipherImportPayload(session, draft);
+          const sourceId = String(raw.id || '').trim();
+          if (sourceId) cipherPayload.id = sourceId;
+          nextPayload.ciphers.push(cipherPayload);
         }
 
         const importedCipherMap = await importCiphers(importAuthedFetch, nextPayload, {
