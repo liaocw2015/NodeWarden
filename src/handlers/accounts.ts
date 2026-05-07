@@ -9,6 +9,11 @@ import { isTotpEnabled, verifyTotpToken } from '../utils/totp';
 import { createRecoveryCode, recoveryCodeEquals } from '../utils/recovery-code';
 import { buildAccountKeys } from '../utils/user-decryption';
 
+// CONTRACT:
+// users.master_password_hash is server-side login verification only. It does
+// not decrypt vault data. Password changes must keep encrypted user key material,
+// securityStamp, refresh-token invalidation, and client compatibility together.
+// Password hints are non-secret reminders; never treat them as recovery secrets.
 function looksLikeEncString(value: string): boolean {
   if (!value) return false;
   const firstDot = value.indexOf('.');
@@ -808,12 +813,18 @@ async function apiKey(request: Request, env: Env, userId: string, rotate: boolea
 // Generate a random alphanumeric string of the given length using crypto.getRandomValues.
 function randomStringAlphanum(length: number): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  const array = new Uint8Array(length);
-  crypto.getRandomValues(array);
-
   let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars[array[i] % chars.length];
+  const maxUnbiased = Math.floor(256 / chars.length) * chars.length;
+  const bytes = new Uint8Array(Math.max(16, length));
+
+  while (result.length < length) {
+    crypto.getRandomValues(bytes);
+    for (const value of bytes) {
+      if (value >= maxUnbiased) continue;
+      result += chars[value % chars.length];
+      if (result.length >= length) break;
+    }
   }
+
   return result;
 }
